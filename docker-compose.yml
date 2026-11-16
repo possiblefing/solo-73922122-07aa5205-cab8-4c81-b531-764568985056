@@ -1,0 +1,44 @@
+# 河流水质站日 CSV 发布服务：两个实例共享同一卷，验证跨实例并发安全。
+# 启动：docker compose up --build
+# 实例 A 文档：http://localhost:8001/docs   实例 B 文档：http://localhost:8002/docs
+services:
+  release-a:
+    build: .
+    image: water-quality-release:latest
+    environment:
+      DATA_DIR: /data
+      MAX_FILE_BYTES: "1048576"   # 单件 1 MiB
+      MAX_RELEASES: "128"         # 累计 128 件，对应 Merkle 树深度 7
+    ports:
+      - "8001:8000"
+    volumes:
+      - shared-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  release-b:
+    image: water-quality-release:latest
+    build: .
+    environment:
+      DATA_DIR: /data
+      MAX_FILE_BYTES: "1048576"
+      MAX_RELEASES: "128"
+    ports:
+      - "8002:8000"
+    volumes:
+      - shared-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - release-a
+
+volumes:
+  shared-data:
