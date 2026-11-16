@@ -15,7 +15,9 @@ services:
       - shared-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      # 自检未通过（degraded）时健康检查失败，docker compose ps 可见；
+      # restart 策略只对进程退出生效，不会因 degraded 反复重启。
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request;sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:8000/health'))['status']=='ok' else 1)"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -33,7 +35,7 @@ services:
       - shared-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request;sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:8000/health'))['status']=='ok' else 1)"]
       interval: 10s
       timeout: 5s
       retries: 5

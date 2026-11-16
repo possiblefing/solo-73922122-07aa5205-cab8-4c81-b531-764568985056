@@ -5,7 +5,9 @@
   1. 并发发布同单：恰有一个写入，另一个幂等复用，不分叉不覆盖；
   2. 并发发布异单：全部成功且序号稠密、检查点连续；
   3. 实例 A 的发布可在实例 B 下载，证明与检查点跨实例一致；
-  4. 杀掉一个实例再重启，历史检查点/证明持续有效，可继续追加。
+  4. 发布风暴期间跨实例连续取证：纳入/追加证明每个都 200 且离线可核验；
+  5. 另一实例持续发布的同时新实例挂同卷启动：自检不误报损坏、
+     发布不被阻塞，历史检查点/证明持续有效，可继续追加。
 
 用法：python scripts/dual_instance_check.py
 """
@@ -20,7 +22,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -211,29 +215,117 @@ def main() -> int:
             f"追加证明条目数 O(log n)={len(append['entries'])} ≤ 14",
         )
 
-        # 5) 故障转移：原实例不杀（本环境 seccomp 禁止 kill），
-        #    另起一个全新进程指向同一共享卷，模拟实例重启/替换。
-        proc_c = start_instance(PORT_C, data_dir)
+        # 4b) 发布风暴期间跨实例连续取证：B 持续发布，A 连续出证明，
+        #     每个响应都必须 200 且离线可核验（修复前会 200 但验不过或 500）。
+        storm_errors: list[str] = []
+
+        def storm_publisher():
+            for i in range(8):
+                status, payload = post_release(
+                    PORT_B,
+                    "STORM",
+                    "2026-11-16",
+                    f"ORD-STORM-{i:02d}",
+                    f"storm-{i}\n".encode(),
+                )
+                if status != 201:
+                    storm_errors.append(f"风暴发布失败 {status}: {payload}")
+                    return
+                time.sleep(0.05)
+
+        _, old_cp1 = get_json(PORT_A, "/checkpoints/1")
+        storm_thread = threading.Thread(target=storm_publisher)
+        storm_thread.start()
+        storm_checks = 0
+        while storm_thread.is_alive():
+            try:
+                _, proof = get_json(
+                    PORT_A, "/releases/ST00/2026-11-16/ORD-00/inclusion-proof"
+                )
+                ok, msg = verify_release_bytes(proof, b"row-0\n")
+                if not ok:
+                    storm_errors.append(f"纳入证明离线核验失败: {msg}")
+                    break
+                _, append = get_json(PORT_A, "/checkpoints/1/append-proof")
+                ok, msg = verify_append_proof(
+                    old_cp1,
+                    {"seq": append["new_seq"], "root_hex": append["new_root"]},
+                    append,
+                )
+                if not ok:
+                    storm_errors.append(f"追加证明离线核验失败: {msg}")
+                    break
+            except urllib.error.HTTPError as exc:
+                storm_errors.append(f"取证请求返回 HTTP {exc.code}")
+                break
+            storm_checks += 1
+        storm_thread.join()
+        check(not storm_errors, f"风暴期间连续取证全部有效（{storm_errors}）")
+        check(storm_checks >= 2, f"风暴窗口内完成 {storm_checks} 轮连续取证")
+
+        # 5) 故障转移 + 启动竞态：另一实例持续发布的同时，
+        #    新实例挂同卷启动（自检与并发发布重叠），不得误报损坏、
+        #    不得阻塞发布；随后可继续追加。
+        boot_errors: list[str] = []
+        boot_stop = threading.Event()
+
+        def boot_publisher():
+            i = 0
+            while not boot_stop.is_set():
+                status, payload = post_release(
+                    PORT_B,
+                    "BOOT",
+                    "2026-11-16",
+                    f"ORD-BOOT-{i:02d}",
+                    f"boot-{i}\n".encode(),
+                )
+                if status != 201:
+                    boot_errors.append(f"启动期间发布失败 {status}: {payload}")
+                    return
+                i += 1
+                time.sleep(0.05)
+
+        _, releases_pre_boot = get_json(PORT_A, "/releases")
+        boot_thread = threading.Thread(target=boot_publisher)
+        boot_thread.start()
         try:
+            proc_c = start_instance(PORT_C, data_dir)
+        finally:
+            boot_stop.set()
+            boot_thread.join()
+        try:
+            check(
+                not boot_errors,
+                f"新实例启动自检期间另一实例发布未受影响（{boot_errors}）",
+            )
             _, health = get_json(PORT_C, "/health")
             check(
-                health["status"] == "ok" and health["release_count"] == 11,
-                "新实例挂载同卷后自检通过且条数仍为 11",
+                health["status"] == "ok",
+                "并发发布期间启动的新实例自检通过、未误报损坏",
             )
-            _, cp_after = get_json(PORT_C, "/checkpoints/latest")
-            check(cp_after == cp_a, "重启视角下最新检查点根摘要不变")
+            _, releases_c = get_json(PORT_C, "/releases")
+            check(
+                len(releases_c) > len(releases_pre_boot),
+                "新实例看到启动期间的并发追加"
+                f"（{len(releases_pre_boot)} -> {len(releases_c)}）",
+            )
+            _, cp_run = get_json(PORT_A, "/checkpoints/latest")
+            _, cp_c = get_json(PORT_C, "/checkpoints/latest")
+            check(cp_c == cp_run, "新实例与运行中实例最新检查点一致")
             status_post, new_pub = post_release(
                 PORT_C, "ST99", "2026-11-16", "ORD-AFTER-RESTART", b"after\n"
             )
             check(
-                status_post == 201 and new_pub["release"]["id"] == 12,
-                "新实例可继续追加，新记录序号=12",
+                status_post == 201
+                and new_pub["release"]["id"] == len(releases_c) + 1,
+                "新实例可继续追加，序号稠密衔接"
+                f"（id={new_pub['release']['id']}）",
             )
-            _, proof12 = get_json(
+            _, proof_new = get_json(
                 PORT_B,
                 "/releases/ST99/2026-11-16/ORD-AFTER-RESTART/inclusion-proof",
             )
-            ok, _ = verify_release_bytes(proof12, b"after\n")
+            ok, _ = verify_release_bytes(proof_new, b"after\n")
             check(ok, "新实例追加记录的纳入证明可在另一实例离线核验")
         finally:
             # 无法 kill：改为脱离进程（它绑定临时目录，会话结束后随环境回收）。

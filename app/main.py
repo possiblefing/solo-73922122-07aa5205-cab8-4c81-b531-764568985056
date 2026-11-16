@@ -8,7 +8,10 @@
    - 同键异字节 -> 409 拒绝，记录不可改；
    - 超累计上限 -> 409 拒绝；
 3. 每次发布追加一个检查点（条数 + Merkle 根），只增不改；
-4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用。
+4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用；
+5. 证明与自检所需的多表状态在同一读事务快照内读取（WAL 快照隔离），
+   另一实例在读取叶子与检查点之间追加时，条数、根与证明仍对应同一
+   完整已提交前缀，且读快照绝不阻塞对方发布。
 """
 from __future__ import annotations
 
@@ -121,7 +124,7 @@ async def publish_release(
         return JSONResponse(status_code=507, content={"detail": str(exc)})
 
     try:
-        record, reused = await run_in_threadpool(
+        record, reused, checkpoint = await run_in_threadpool(
             database.publish,
             station_id,
             sample_date,
@@ -132,7 +135,6 @@ async def publish_release(
     except ConflictError as exc:
         raise HTTPException(409, str(exc))
 
-    checkpoint = await run_in_threadpool(database.latest_checkpoint)
     return PublishResult(
         reused=reused,
         release=ReleaseOut(**record),
@@ -233,15 +235,19 @@ async def list_checkpoints():
 )
 async def inclusion_proof(station_id: str, sample_date: str, order_no: str):
     _require_healthy()
-    record = await run_in_threadpool(
-        database.get_release, station_id, sample_date, order_no
+    # 记录、叶子集合与检查点取自同一读事务快照：另一实例在读取期间
+    # 追加时，证明与其检查点仍对应同一完整已提交前缀，离线核验通过。
+    snapshot = await run_in_threadpool(
+        database.inclusion_snapshot, station_id, sample_date, order_no
     )
-    if record is None:
+    if snapshot is None:
         raise HTTPException(404, "未找到该站号/日期/发布单号对应的发布记录")
+    record, leaves, checkpoint = snapshot
     index = record["id"] - 1
-    leaves = await run_in_threadpool(database.leaf_hashes)
+    if checkpoint["seq"] != len(leaves) or index >= len(leaves):
+        # 快照不变量被破坏只可能是真实库存损坏（启动自检会先置 degraded）。
+        raise HTTPException(500, "检查点与叶子条数不一致")
     path = merkle.inclusion_path(index, leaves, settings.tree_depth)
-    checkpoint = await run_in_threadpool(database.latest_checkpoint)
     leaf_record = LeafRecordOut(
         v=merkle.LEAF_VERSION,
         station_id=record["station_id"],
@@ -268,12 +274,14 @@ async def inclusion_proof(station_id: str, sample_date: str, order_no: str):
 )
 async def append_proof(old_seq: int):
     _require_healthy()
-    old_cp = await run_in_threadpool(database.get_checkpoint, old_seq)
-    if old_cp is None:
+    # 旧/新检查点与叶子集合取自同一读事务快照：并发追加不会再造成
+    # “检查点条数与叶子条数错位”，追加证明稳定可出、可离线核验。
+    snapshot = await run_in_threadpool(database.append_proof_snapshot, old_seq)
+    if snapshot is None:
         raise HTTPException(404, f"不存在序号为 {old_seq} 的旧检查点")
-    new_cp = await run_in_threadpool(database.latest_checkpoint)
-    leaves = await run_in_threadpool(database.leaf_hashes)
+    old_cp, new_cp, leaves = snapshot
     if new_cp["seq"] != len(leaves):
+        # 快照不变量被破坏只可能是真实库存损坏（启动自检会先置 degraded）。
         raise HTTPException(500, "检查点与叶子条数不一致")
     entries = await run_in_threadpool(
         merkle.append_proof, leaves, old_cp["seq"], settings.tree_depth

@@ -21,6 +21,19 @@ def test_empty_root_is_stable():
     assert merkle.empty_root(3) != merkle.empty_root(7)
 
 
+def test_prefix_roots_match_root_from_leaves_for_every_prefix():
+    """prefix_roots[k] 必须等于 leaves[:k] 独立算根（启动自检逐点复算的依据）。"""
+    for depth in (1, 3, 5):
+        capacity = 1 << depth
+        leaves = _leaves(capacity)  # 覆盖满槽极端情形
+        roots = merkle.prefix_roots(leaves, depth)
+        assert len(roots) == capacity + 1
+        for k in range(capacity + 1):
+            assert roots[k] == merkle.root_from_leaves(leaves[:k], depth)
+    # 空叶子集合：只有空前缀一个根。
+    assert merkle.prefix_roots([], 4) == [merkle.empty_root(4)]
+
+
 def test_root_append_only_monotonic_and_inclusion():
     depth = 3
     leaves: list[bytes] = []

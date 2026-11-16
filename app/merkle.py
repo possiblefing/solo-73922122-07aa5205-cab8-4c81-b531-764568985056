@@ -77,6 +77,38 @@ def empty_root(depth: int) -> bytes:
     return root_from_leaves([], depth)
 
 
+def prefix_roots(leaf_hashes: Sequence[bytes], depth: int) -> list[bytes]:
+    """返回每个前缀长度 k = 0..len(leaf_hashes) 对应的固定深度树根。
+
+    ``prefix_roots(leaves, depth)[k] == root_from_leaves(leaves[:k], depth)``。
+    相邻前缀的树仅在新叶子到根的路径上不同，因此沿路径增量更新，
+    总开销 O(capacity + n * depth)，供启动自检逐点复算全部历史检查点。
+    """
+    capacity = 1 << depth
+    n = len(leaf_hashes)
+    if n > capacity:
+        raise ValueError("叶子数量超过树容量")
+    # levels[h][i]：高度 h 上的第 i 个节点；初始为空前缀（全部 EMPTY_LEAF）。
+    levels: list[list[bytes]] = [[EMPTY_LEAF] * capacity]
+    for _ in range(depth):
+        prev = levels[-1]
+        levels.append(
+            [pair_hash(prev[i], prev[i + 1]) for i in range(0, len(prev), 2)]
+        )
+    roots = [levels[depth][0]]
+    for k in range(n):
+        pos = k
+        levels[0][pos] = leaf_hashes[k]
+        for h in range(depth):
+            parent = pos // 2
+            levels[h + 1][parent] = pair_hash(
+                levels[h][2 * parent], levels[h][2 * parent + 1]
+            )
+            pos = parent
+        roots.append(levels[depth][0])
+    return roots
+
+
 # --------------------------------------------------------------------------- #
 # 纳入证明（inclusion proof）
 # --------------------------------------------------------------------------- #

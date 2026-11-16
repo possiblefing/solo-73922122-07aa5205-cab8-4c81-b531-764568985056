@@ -16,7 +16,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 # 避免与模块级 Database/BlobStore 的初始化顺序冲突。
 _DATA_DIR = Path(tempfile.mkdtemp(prefix="wq-release-test-"))
 os.environ["DATA_DIR"] = str(_DATA_DIR)
-os.environ["MAX_RELEASES"] = "16"  # depth=4，足够容纳全部用例的发布
+os.environ["MAX_RELEASES"] = "32"  # depth=5，足够容纳全部用例的发布
 os.environ["MAX_FILE_BYTES"] = str(64 * 1024)
 
 
